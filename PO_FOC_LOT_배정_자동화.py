@@ -10,6 +10,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -29,6 +30,8 @@ ORDER_TYPES = ("PO", "FOC")
 WAREHOUSE_PRIORITY = ("GD", "DU")
 PASS_STATUS = "통과"
 UNKNOWN_VALUE = "미확인"
+KOREA_TZ = ZoneInfo("Asia/Seoul")
+APP_VERSION = "2.0.0"
 OUTPUT_HEADERS = [
     "구분",
     "주문 원본행",
@@ -491,6 +494,210 @@ def product_match_status(order_product: str, inventory_names: Iterable[str]) -> 
     return "일치" if any(normalize_product_name(name) == order_name for name in names) else "불일치"
 
 
+def inspect_inputs(order_path: Path, inventory_path: Path) -> dict:
+    """배정 전 입력 파일의 구조와 기초 수량을 검증한다."""
+    for label, path in (("PO/FOC 주문 파일", order_path), ("글로벌 재고 파일", inventory_path)):
+        if not path.exists() or not path.is_file():
+            raise InputFormatError(f"{label}을 찾을 수 없습니다: {path}")
+        if path.suffix.lower() != ".xlsx":
+            raise InputFormatError(f"{label}은 .xlsx 파일이어야 합니다.")
+
+    order_rows = load_order_rows(order_path)
+    lots, inventory_report = load_inventory_lots_with_report(inventory_path)
+
+    order_counts = {
+        order_type: len(order_rows.get(order_type, [])) for order_type in ORDER_TYPES
+    }
+    request_quantities = {
+        order_type: sum(int(row["요청수량"]) for row in order_rows.get(order_type, []))
+        for order_type in ORDER_TYPES
+    }
+    usable_quantity_by_warehouse = {
+        warehouse: sum(
+            int(lot["잔여재고"])
+            for lot in lots
+            if lot["창고"] == warehouse
+        )
+        for warehouse in ("GD", "DU")
+    }
+
+    inventory_barcodes = {lot["바코드"] for lot in lots}
+    orders = [row for order_type in ORDER_TYPES for row in order_rows.get(order_type, [])]
+    missing_inventory_rows = [
+        row for row in orders if row["바코드"] not in inventory_barcodes
+    ]
+
+    names_by_barcode: Dict[str, set[str]] = defaultdict(set)
+    for lot in lots:
+        names_by_barcode[lot["바코드"]].update(lot.get("재고 제품명들", set()))
+    mismatch_rows = [
+        row
+        for row in orders
+        if row["바코드"] in inventory_barcodes
+        and product_match_status(row["제품명"], names_by_barcode[row["바코드"]]) == "불일치"
+    ]
+
+    warnings: List[str] = []
+    if missing_inventory_rows:
+        warnings.append(f"사용 가능한 재고가 없는 주문 {len(missing_inventory_rows):,}행")
+    if mismatch_rows:
+        warnings.append(f"주문·재고 제품명 불일치 후보 {len(mismatch_rows):,}행")
+    if inventory_report.get("EXP 미확인 수량", 0):
+        warnings.append(
+            f"EXP 미확인 재고 {inventory_report['EXP 미확인 수량']:,}개"
+        )
+    if inventory_report.get("LOT 미확인 수량", 0):
+        warnings.append(
+            f"LOT 미확인 재고 {inventory_report['LOT 미확인 수량']:,}개"
+        )
+
+    return {
+        "status": "WARNING" if warnings else "PASS",
+        "order_counts": order_counts,
+        "request_quantities": request_quantities,
+        "total_order_rows": len(orders),
+        "total_request_quantity": sum(request_quantities.values()),
+        "usable_quantity_by_warehouse": usable_quantity_by_warehouse,
+        "usable_inventory_quantity": sum(usable_quantity_by_warehouse.values()),
+        "grouped_lot_count": len(lots),
+        "missing_inventory_rows": len(missing_inventory_rows),
+        "product_mismatch_rows": len(mismatch_rows),
+        "inventory_report": inventory_report,
+        "warnings": warnings,
+    }
+
+
+def validate_allocation_integrity(
+    order_rows: Dict[str, List[dict]],
+    lots: List[dict],
+    result_rows: List[dict],
+    summaries: List[dict],
+    *,
+    order_priority: Tuple[str, str] = ORDER_TYPES,
+) -> List[dict]:
+    """배정 결과가 주문·재고 보존 규칙을 만족하는지 검산한다."""
+    checks: List[dict] = []
+
+    def add_check(name: str, passed: bool, detail: str) -> None:
+        checks.append(
+            {"검증 항목": name, "상태": "PASS" if passed else "FAIL", "결과": detail}
+        )
+
+    expected_order_count = sum(len(order_rows.get(kind, [])) for kind in ORDER_TYPES)
+    add_check(
+        "주문행 보존",
+        len(summaries) == expected_order_count,
+        f"입력 {expected_order_count:,}행 / 요약 {len(summaries):,}행",
+    )
+
+    unique_ids = {item["주문 ID"] for item in summaries}
+    add_check(
+        "주문 ID 유일성",
+        len(unique_ids) == len(summaries),
+        f"전체 {len(summaries):,}건 / 유일 {len(unique_ids):,}건",
+    )
+
+    partial_orders = [
+        item
+        for item in summaries
+        if float(item["배정수량"]) not in (0.0, float(item["요청수량"]))
+    ]
+    add_check(
+        "전량 배정 원칙",
+        not partial_orders,
+        f"부분 배정 {len(partial_orders):,}행",
+    )
+
+    detail_by_order: Dict[str, float] = defaultdict(float)
+    for row in result_rows:
+        detail_by_order[row["주문 ID"]] += float(row.get("LOT 배정수량") or 0)
+    mismatched_order_totals = [
+        item
+        for item in summaries
+        if detail_by_order[item["주문 ID"]] != float(item["배정수량"])
+    ]
+    add_check(
+        "주문별 상세·요약 합계",
+        not mismatched_order_totals,
+        f"불일치 {len(mismatched_order_totals):,}행",
+    )
+
+    detail_total = sum(detail_by_order.values())
+    summary_total = sum(float(item["배정수량"]) for item in summaries)
+    add_check(
+        "전체 배정수량 합계",
+        detail_total == summary_total,
+        f"상세 {number_for_excel(detail_total):,} / 요약 {number_for_excel(summary_total):,}",
+    )
+
+    consumed_inventory = sum(
+        int(lot["원재고"]) - int(lot["잔여재고"]) for lot in lots
+    )
+    add_check(
+        "재고 차감·배정 합계",
+        consumed_inventory == summary_total,
+        f"재고 차감 {consumed_inventory:,} / 배정 {number_for_excel(summary_total):,}",
+    )
+
+    negative_lots = [lot for lot in lots if int(lot["잔여재고"]) < 0]
+    add_check("음수 재고 방지", not negative_lots, f"음수 LOT {len(negative_lots):,}건")
+
+    gl_rows = [row for row in result_rows if row.get("배정창고") == "GL"]
+    add_check("GL 배정 제외", not gl_rows, f"GL 배정 {len(gl_rows):,}행")
+
+    actual_sequence = [item["구분"] for item in summaries]
+    first, second = order_priority
+    first_after_second = any(
+        kind == first and second in actual_sequence[:index]
+        for index, kind in enumerate(actual_sequence)
+    )
+    add_check(
+        "주문 우선순위",
+        not first_after_second,
+        f"적용 순서 {first} → {second}",
+    )
+
+    warning_specs = [
+        (
+            "미배정 주문",
+            sum(1 for item in summaries if item["상태"] != "배정완료"),
+            "행",
+        ),
+        (
+            "제품명 불일치",
+            sum(1 for row in result_rows if row.get("제품명 일치 여부") == "불일치"),
+            "행",
+        ),
+        (
+            "EXP 미확인 배정",
+            sum(
+                int(row.get("LOT 배정수량") or 0)
+                for row in result_rows
+                if row.get("유통기한 상태") == UNKNOWN_VALUE
+            ),
+            "개",
+        ),
+        (
+            "LOT 미확인 배정",
+            sum(
+                int(row.get("LOT 배정수량") or 0)
+                for row in result_rows
+                if row.get("배정된 로트번호") == UNKNOWN_VALUE
+            ),
+            "개",
+        ),
+    ]
+    for name, count, unit in warning_specs:
+        checks.append(
+            {
+                "검증 항목": name,
+                "상태": "WARNING" if count else "PASS",
+                "결과": f"{count:,}{unit}",
+            }
+        )
+    return checks
+
+
 def allocate_orders(
     order_rows: Dict[str, List[dict]],
     lots: List[dict],
@@ -722,6 +929,10 @@ def build_output_workbook(
     summaries: List[dict],
     inventory_report: Optional[dict] = None,
     allocation_settings: Optional[dict] = None,
+    integrity_checks: Optional[List[dict]] = None,
+    order_display_name: Optional[str] = None,
+    inventory_display_name: Optional[str] = None,
+    executed_at: Optional[datetime] = None,
 ) -> Workbook:
     wb = Workbook()
     ws = wb.active
@@ -756,10 +967,14 @@ def build_output_workbook(
     if allow_split:
         warehouse_rule += f" → 필요 시 {first_warehouse}+{second_warehouse} 합산"
 
+    display_order_name = order_display_name or order_path.name
+    display_inventory_name = inventory_display_name or inventory_path.name
+    run_at = executed_at or datetime.now(KOREA_TZ)
+
     info_rows = [
         [
-            "입력 주문 파일", order_path.name,
-            "입력 재고 파일", inventory_path.name,
+            "입력 주문 파일", display_order_name,
+            "입력 재고 파일", display_inventory_name,
             "배정 기준", warehouse_rule,
             "사용 재고", "판정='통과'",
         ],
@@ -773,7 +988,7 @@ def build_output_workbook(
             "전체 요청", number_for_excel(total_request),
             "전체 배정", number_for_excel(total_allocated),
             "미배정", number_for_excel(total_request - total_allocated),
-            "재고 부족 주문행", shortage_count,
+            "미배정 주문행", shortage_count,
         ],
         [
             "LOT 우선순위", "EXP 오름차순 → 같은 EXP는 현재 잔여수량 오름차순 → LOT 번호순",
@@ -897,8 +1112,6 @@ def build_output_workbook(
             ),
         )
 
-    ws.auto_filter.ref = None
-
     # 주문당 한 행으로 구성된 집계용 요약 시트
     summary_ws = wb.create_sheet("주문 요약")
     summary_ws.sheet_view.showGridLines = False
@@ -944,7 +1157,8 @@ def build_output_workbook(
     validation_ws = wb.create_sheet("검증 요약")
     validation_ws.sheet_view.showGridLines = False
     validation_ws["A1"] = "검증 항목"
-    validation_ws["B1"] = "결과"
+    validation_ws["B1"] = "상태"
+    validation_ws["C1"] = "결과"
     for cell in validation_ws[1]:
         cell.fill = header_fill
         cell.font = header_font
@@ -966,35 +1180,49 @@ def build_output_workbook(
         if row.get("배정된 로트번호") == UNKNOWN_VALUE
     )
     validation_rows = [
-        ("실행 일시", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("주문 파일", order_path.name),
-        ("재고 파일", inventory_path.name),
-        ("전체 주문행", len(summaries)),
-        ("배정완료 주문행", sum(1 for item in summaries if item["상태"] == "배정완료")),
-        ("재고부족 주문행", shortage_count),
-        ("전체 재고행", report.get("전체 재고행", 0)),
-        ("GD/DU 재고행", report.get("GD/DU 재고행", 0)),
-        ("통과 재고수량", report.get("통과 재고수량", 0)),
-        ("상태 제외 수량", report.get("상태 제외 수량", 0)),
-        ("GL 제외 수량", report.get("GL 제외 수량", 0)),
-        ("EXP 미확인 재고수량", report.get("EXP 미확인 수량", 0)),
-        ("LOT 미확인 재고수량", report.get("LOT 미확인 수량", 0)),
-        ("EXP 미확인 배정수량", allocated_unknown_exp),
-        ("LOT 미확인 배정수량", allocated_unknown_lot),
-        ("제품명 불일치 상세행", mismatch_rows),
-        ("상세 요청수량 집계", "주문별 첫 상세행에만 표시"),
-        ("권장 집계 시트", "주문 요약"),
+        ("앱 버전", "INFO", APP_VERSION),
+        ("실행 일시", "INFO", run_at.strftime("%Y-%m-%d %H:%M:%S KST")),
+        ("주문 파일", "INFO", display_order_name),
+        ("재고 파일", "INFO", display_inventory_name),
+        ("전체 주문행", "INFO", len(summaries)),
+        ("배정완료 주문행", "INFO", sum(1 for item in summaries if item["상태"] == "배정완료")),
+        ("미배정 주문행", "INFO", shortage_count),
+        ("전체 재고행", "INFO", report.get("전체 재고행", 0)),
+        ("GD/DU 재고행", "INFO", report.get("GD/DU 재고행", 0)),
+        ("통과 재고수량", "INFO", report.get("통과 재고수량", 0)),
+        ("상태 제외 수량", "INFO", report.get("상태 제외 수량", 0)),
+        ("GL 제외 수량", "INFO", report.get("GL 제외 수량", 0)),
+        ("EXP 미확인 재고수량", "INFO", report.get("EXP 미확인 수량", 0)),
+        ("LOT 미확인 재고수량", "INFO", report.get("LOT 미확인 수량", 0)),
+        ("EXP 미확인 배정수량", "INFO", allocated_unknown_exp),
+        ("LOT 미확인 배정수량", "INFO", allocated_unknown_lot),
+        ("제품명 불일치 상세행", "INFO", mismatch_rows),
     ]
-    for row_index, (label, value) in enumerate(validation_rows, start=2):
+    validation_rows.extend(
+        (item["검증 항목"], item["상태"], item["결과"])
+        for item in (integrity_checks or [])
+    )
+    status_fills = {
+        "PASS": PatternFill("solid", fgColor="E2F0D9"),
+        "WARNING": PatternFill("solid", fgColor="FFF2CC"),
+        "FAIL": PatternFill("solid", fgColor="FCE4D6"),
+        "INFO": PatternFill("solid", fgColor="D9EAF7"),
+    }
+    for row_index, (label, status, value) in enumerate(validation_rows, start=2):
         label_cell = validation_ws.cell(row_index, 1, label)
-        value_cell = validation_ws.cell(row_index, 2, excel_safe_value(value))
+        status_cell = validation_ws.cell(row_index, 2, status)
+        value_cell = validation_ws.cell(row_index, 3, excel_safe_value(value))
         label_cell.fill = label_fill
         label_cell.font = label_font
-        for cell in (label_cell, value_cell):
+        status_cell.fill = status_fills.get(status, status_fills["INFO"])
+        status_cell.font = Font(name="맑은 고딕", bold=True, size=10)
+        status_cell.alignment = Alignment(horizontal="center", vertical="center")
+        for cell in (label_cell, status_cell, value_cell):
             cell.border = info_border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
     validation_ws.column_dimensions["A"].width = 30
-    validation_ws.column_dimensions["B"].width = 55
+    validation_ws.column_dimensions["B"].width = 13
+    validation_ws.column_dimensions["C"].width = 58
     validation_ws.freeze_panes = "A2"
     return wb
 
@@ -1023,6 +1251,9 @@ def create_allocation_file(
     warehouse_priority: Tuple[str, str] = WAREHOUSE_PRIORITY,
     allow_split: bool = True,
     order_priority: Tuple[str, str] = ORDER_TYPES,
+    order_display_name: Optional[str] = None,
+    inventory_display_name: Optional[str] = None,
+    executed_at: Optional[datetime] = None,
 ) -> dict:
     validate_paths(order_path, inventory_path, output_path)
 
@@ -1035,6 +1266,17 @@ def create_allocation_file(
         allow_split=allow_split,
         order_priority=order_priority,
     )
+    integrity_checks = validate_allocation_integrity(
+        order_rows,
+        lots,
+        result_rows,
+        summaries,
+        order_priority=order_priority,
+    )
+    failed_checks = [item for item in integrity_checks if item["상태"] == "FAIL"]
+    if failed_checks:
+        failed_names = ", ".join(item["검증 항목"] for item in failed_checks)
+        raise RuntimeError(f"배정 결과 내부 검증에 실패했습니다: {failed_names}")
     workbook = build_output_workbook(
         order_path,
         inventory_path,
@@ -1046,6 +1288,10 @@ def create_allocation_file(
             "allow_split": allow_split,
             "order_priority": order_priority,
         },
+        integrity_checks=integrity_checks,
+        order_display_name=order_display_name,
+        inventory_display_name=inventory_display_name,
+        executed_at=executed_at,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1076,6 +1322,7 @@ def create_allocation_file(
         "result_data": result_rows,
         "summary_data": summaries,
         "inventory_report": inventory_report,
+        "integrity_checks": integrity_checks,
     }
 
 
@@ -1161,7 +1408,7 @@ def main() -> None:
     print(f"전체 요청수량: {number_for_excel(result['total_request']):,}")
     print(f"전체 배정수량: {number_for_excel(result['total_allocated']):,}")
     print(f"미배정수량: {number_for_excel(result['unallocated']):,}")
-    print(f"재고 부족 주문행: {result['shortage_lines']:,}")
+    print(f"미배정 주문행: {result['shortage_lines']:,}")
     print(f"결과 상세행: {result['result_rows']:,}")
 
     if sys.stdin.isatty() and not all([args.order, args.inventory, args.out]):
